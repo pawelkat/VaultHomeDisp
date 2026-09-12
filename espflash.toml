@@ -1,0 +1,4 @@
+[flash]
+size = "8MB"
+mode = "dio"
+frequency = "80MHz"
