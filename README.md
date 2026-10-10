@@ -1,4 +1,4 @@
-# crowpanel-embassy
+# VaultHomeDisp
 
 Embassy + esp-hal firmware for the Elecrow **CrowPanel 5.79″ e-paper** (DIS08792E).
 
@@ -18,4 +18,8 @@ cargo run --release
 
 USB-C on the panel. Hold **BOOT**, tap **RST** if the port does not appear.
 
-v1 drives the dual SSD1683 (792 × 272 B/W) and paints **hi Pawel** with Slint's software renderer, then deep-sleeps the panel. The onboard LED (GPIO41) still blinks; MENU / EXIT / dial still log over UART. Liberation Sans is vendored under `ui/fonts/` (SIL OFL).
+Wi-Fi credentials are read at build time from the environment (`WIFI_SSID`, `WIFI_PASSWORD`, optional `WIFI_SSID2` / `WIFI_PASSWORD2`) or from a gitignored `wifi.env` in this directory.
+
+Visual orientation is **USB-C up**, buttons on the **left** (180° from the panel native scan). Slint (0,0) is that visual top-left.
+
+The panel joins Wi-Fi, shows `http://<ip>/mcp`, and serves streamable-HTTP MCP on port 80. `show_text` queues a full refresh and returns immediately. `panel_status` reads IP and refresh state. A bitmap tool is not implemented yet. The onboard LED (GPIO41) blinks; MENU / EXIT / dial still log over UART. Liberation Sans is vendored under `ui/fonts/` (SIL OFL).

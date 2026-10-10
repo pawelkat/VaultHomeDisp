@@ -9,31 +9,49 @@
 
 mod board;
 mod epd;
+mod mcp;
+mod panel;
 
 use alloc::boxed::Box;
 use alloc::rc::Rc;
+use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU8, Ordering};
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, select};
+use embassy_net::{Config, Runner, Stack, StackResources};
 use embassy_time::{Duration, Timer};
 use epd::Epd;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
-use esp_hal::spi::master::{Config as SpiConfig, Spi};
+use esp_hal::rng::Rng;
 use esp_hal::spi::Mode;
+use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
-use log::info;
+use log::{error, info, warn};
+use panel::PanelJob;
+use slint::PhysicalSize;
 use slint::platform::software_renderer::{
     LineBufferProvider, MinimalSoftwareWindow, RepaintBufferType, Rgb565Pixel,
 };
 use slint::platform::{Platform, WindowAdapter};
-use slint::PhysicalSize;
+use static_cell::StaticCell;
 
 extern crate alloc;
 
 slint::include_modules!();
+
+const WIFI_SSID: &str = env!("WIFI_SSID");
+const WIFI_PASSWORD: &str = env!("WIFI_PASSWORD");
+const WIFI_SSID2: &str = env!("WIFI_SSID2");
+const WIFI_PASSWORD2: &str = env!("WIFI_PASSWORD2");
+/// 0 = primary, 1 = optional fallback.
+static WIFI_NET: AtomicU8 = AtomicU8::new(0);
+
+static STACK_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -73,8 +91,11 @@ impl LineBufferProvider for PackedLines<'_> {
         render_fn(slice);
         for (dx, pixel) in slice.iter().enumerate() {
             let x = range.start + dx;
-            let pos = (line * board::WIDTH + x) / 8;
-            let bit = 7 - (x % 8);
+            // 180°: USB-C up, buttons on the left.
+            let rx = board::WIDTH - 1 - x;
+            let ry = board::HEIGHT - 1 - line;
+            let pos = (ry * board::WIDTH + rx) / 8;
+            let bit = 7 - (rx % 8);
             if rgb565_is_white(*pixel) {
                 self.packed[pos] |= 1 << bit;
             } else {
@@ -98,21 +119,18 @@ fn rgb565_is_white(pixel: Rgb565Pixel) -> bool {
 )]
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
-    // generator version: 1.3.0
-    // generator parameters: --chip esp32s3 -o embassy -o unstable-hal -o log -o esp-backtrace -o alloc
-
     esp_println::logger::init_logger_from_env();
 
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
-    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 73744);
-
+    // PSRAM first so ordinary allocations stay off the internal heap Wi-Fi needs.
     let psram_config = esp_hal::psram::PsramConfig {
         mode: esp_hal::psram::PsramMode::OctalSpi,
         ..Default::default()
     };
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram, psram_config);
+    esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_interrupt =
@@ -120,16 +138,16 @@ async fn main(spawner: Spawner) -> ! {
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
     info!(
-        "crowpanel-embassy on {}x{} dual SSD1683",
+        "VaultHomeDisp on {}x{} dual SSD1683 (USB-C up, buttons left)",
         board::WIDTH,
         board::HEIGHT
     );
-    info!("Embassy initialized!");
 
     let _epd_pwr = Output::new(peripherals.GPIO7, Level::High, OutputConfig::default());
     Timer::after(Duration::from_millis(100)).await;
 
     let led = Output::new(peripherals.GPIO41, Level::Low, OutputConfig::default());
+    spawner.spawn(led_task(led).unwrap());
 
     let pull_up = InputConfig::default().with_pull(Pull::Up);
     let exit = Input::new(peripherals.GPIO1, pull_up);
@@ -158,55 +176,244 @@ async fn main(spawner: Spawner) -> ! {
             InputConfig::default().with_pull(Pull::Down),
         ),
     );
-    epd.init().await;
 
     let window = MinimalSoftwareWindow::new(RepaintBufferType::NewBuffer);
     slint::platform::set_platform(Box::new(EspPlatform {
         window: window.clone(),
     }))
     .unwrap();
-    window.set_size(PhysicalSize::new(
-        board::WIDTH as u32,
-        board::HEIGHT as u32,
-    ));
-
+    window.set_size(PhysicalSize::new(board::WIDTH as u32, board::HEIGHT as u32));
     let ui = MainWindow::new().unwrap();
     ui.show().unwrap();
-    slint::platform::update_timers_and_animations();
 
     let mut packed = vec![0xFFu8; epd::BUFFER_LEN];
     let mut line: Vec<Rgb565Pixel> = vec![Rgb565Pixel(0); board::WIDTH];
-    let drawn = window.draw_if_needed(|renderer| {
-        renderer.render_by_line(PackedLines {
-            packed: &mut packed,
-            line: &mut line,
-        });
-    });
-    info!("slint render dirty={drawn}");
 
-    epd.display(&packed).await;
-    epd.deep_sleep().await;
-    info!("hi Pawel is on the panel");
+    if WIFI_SSID.is_empty() {
+        error!("WIFI_SSID is empty. Rebuild with wifi.env or WIFI_SSID / WIFI_PASSWORD");
+        epd.init().await;
+        paint(
+            &ui,
+            &window,
+            &mut epd,
+            &mut packed,
+            &mut line,
+            "Set WIFI_SSID",
+            "wifi.env",
+        )
+        .await;
+        button_loop(menu, exit, dial_up, dial_down, dial_push).await;
+    }
 
-    spawner.spawn(led_task(led).unwrap());
+    let rng = Rng::new();
+    let r1 = rng.random();
+    let r2 = rng.random();
+    mcp::seed_session(r1 ^ r2);
+    let seed = (r1 as u64) << 32 | r2 as u64;
+
+    let (wifi_controller, interfaces) = esp_radio::wifi::new(peripherals.WIFI, Default::default())
+        .expect("Failed to initialize Wi-Fi controller");
+    let (stack, runner) = embassy_net::new(
+        interfaces.station,
+        Config::dhcpv4(Default::default()),
+        STACK_RESOURCES.init(StackResources::new()),
+        seed,
+    );
+    spawner.spawn(net_task(runner).unwrap());
+    spawner.spawn(wifi_task(wifi_controller).unwrap());
+
+    if WIFI_SSID2.is_empty() {
+        info!("Connecting to SSID `{WIFI_SSID}` ...");
+    } else {
+        info!("Connecting to SSID `{WIFI_SSID}` (fallback `{WIFI_SSID2}`)");
+    }
+
+    // Panel init overlaps association. The controller needs a full refresh
+    // before the first image.
+    epd.init().await;
+
+    loop {
+        if let Some(ip) = ipv4(stack) {
+            panel::set_ip(ip).await;
+            break;
+        }
+        Timer::after(Duration::from_millis(200)).await;
+    }
+    let ip = panel::ip().await;
+    let url = alloc::format!("http://{ip}/mcp");
+    info!("MCP: POST {url}  tools: show_text, panel_status");
+
+    spawner.spawn(mcp::run(stack).unwrap());
+
+    panel::set_refreshing(true).await;
+    paint(
+        &ui,
+        &window,
+        &mut epd,
+        &mut packed,
+        &mut line,
+        "MCP ready",
+        &url,
+    )
+    .await;
+    panel::note_shown("MCP ready").await;
 
     let mut last = [false; 5];
     loop {
-        let now = [
-            menu.is_low(),
-            exit.is_low(),
-            dial_up.is_low(),
-            dial_down.is_low(),
-            dial_push.is_low(),
-        ];
-        const NAMES: [&str; 5] = ["MENU", "EXIT", "DIAL_UP", "DIAL_DOWN", "DIAL_PUSH"];
-        for i in 0..5 {
-            if now[i] && !last[i] {
-                info!("{} pressed", NAMES[i]);
+        match select(panel::wait_kick(), Timer::after(Duration::from_millis(50))).await {
+            Either::First(()) => {
+                while let Some(job) = panel::take().await {
+                    match job {
+                        PanelJob::Text(text) => {
+                            info!("panel refresh ({} chars)", text.chars().count());
+                            panel::set_refreshing(true).await;
+                            paint(&ui, &window, &mut epd, &mut packed, &mut line, &text, &url)
+                                .await;
+                            panel::note_shown(&text).await;
+                            info!("panel refresh done");
+                        }
+                    }
+                }
+            }
+            Either::Second(()) => {
+                poll_buttons(&menu, &exit, &dial_up, &dial_down, &dial_push, &mut last);
             }
         }
-        last = now;
+    }
+}
+
+async fn paint(
+    ui: &MainWindow,
+    window: &MinimalSoftwareWindow,
+    epd: &mut Epd<'_>,
+    packed: &mut [u8],
+    line: &mut [Rgb565Pixel],
+    message: &str,
+    status: &str,
+) {
+    packed.fill(0xFF);
+    ui.set_message(message.into());
+    ui.set_status(status.into());
+    window.request_redraw();
+    slint::platform::update_timers_and_animations();
+    let drawn = window.draw_if_needed(|renderer| {
+        renderer.render_by_line(PackedLines { packed, line });
+    });
+    info!("slint render dirty={drawn}");
+    epd.display(packed).await;
+}
+
+fn poll_buttons(
+    menu: &Input<'_>,
+    exit: &Input<'_>,
+    dial_up: &Input<'_>,
+    dial_down: &Input<'_>,
+    dial_push: &Input<'_>,
+    last: &mut [bool; 5],
+) {
+    let now = [
+        menu.is_low(),
+        exit.is_low(),
+        dial_up.is_low(),
+        dial_down.is_low(),
+        dial_push.is_low(),
+    ];
+    const NAMES: [&str; 5] = ["MENU", "EXIT", "DIAL_UP", "DIAL_DOWN", "DIAL_PUSH"];
+    for i in 0..5 {
+        if now[i] && !last[i] {
+            info!("{} pressed", NAMES[i]);
+        }
+    }
+    *last = now;
+}
+
+async fn button_loop(
+    menu: Input<'_>,
+    exit: Input<'_>,
+    dial_up: Input<'_>,
+    dial_down: Input<'_>,
+    dial_push: Input<'_>,
+) -> ! {
+    let mut last = [false; 5];
+    loop {
+        poll_buttons(&menu, &exit, &dial_up, &dial_down, &dial_push, &mut last);
         Timer::after(Duration::from_millis(20)).await;
+    }
+}
+
+fn ipv4(stack: Stack<'_>) -> Option<String> {
+    let cfg = stack.config_v4()?;
+    let cidr = cfg.address.to_string();
+    Some(cidr.split('/').next().unwrap_or(cidr.as_str()).to_string())
+}
+
+#[embassy_executor::task]
+async fn net_task(mut runner: Runner<'static, esp_radio::wifi::Interface<'static>>) -> ! {
+    runner.run().await
+}
+
+fn wifi_networks() -> [(&'static str, &'static str); 2] {
+    [(WIFI_SSID, WIFI_PASSWORD), (WIFI_SSID2, WIFI_PASSWORD2)]
+}
+
+#[embassy_executor::task]
+async fn wifi_task(mut controller: esp_radio::wifi::WifiController<'static>) {
+    let nets = wifi_networks();
+    let mut idx = 0usize;
+    loop {
+        let Some(j) = (0..nets.len())
+            .map(|k| (idx + k) % nets.len())
+            .find(|&n| !nets[n].0.is_empty())
+        else {
+            error!("No Wi-Fi SSID configured");
+            return;
+        };
+        let (ssid, password) = nets[j];
+        WIFI_NET.store(j as u8, Ordering::Relaxed);
+
+        let station_config = esp_radio::wifi::sta::StationConfig::default()
+            .with_ssid(ssid)
+            .with_password(password.to_string());
+        let radio_config = esp_radio::wifi::Config::Station(station_config);
+        if let Err(e) = controller.set_config(&radio_config) {
+            error!("Wi-Fi set_config `{ssid}` failed: {e:?}");
+            idx = j.wrapping_add(1);
+            Timer::after(Duration::from_secs(2)).await;
+            continue;
+        }
+
+        let kind = if j == 0 { "primary" } else { "fallback" };
+        info!("Connecting to `{ssid}` ({kind})");
+        match select(
+            controller.connect_async(),
+            Timer::after(Duration::from_secs(15)),
+        )
+        .await
+        {
+            Either::First(Ok(_info)) => {
+                info!("Wi-Fi associated with `{ssid}`");
+                let _ = controller.wait_for_disconnect_async().await;
+                warn!("Wi-Fi disconnected from `{ssid}`, retrying primary...");
+                idx = 0;
+                Timer::after(Duration::from_secs(2)).await;
+            }
+            Either::First(Err(e)) => {
+                error!("Wi-Fi connect `{ssid}` failed: {e:?}");
+                idx = j.wrapping_add(1);
+                let wait = if nets.iter().filter(|(s, _)| !s.is_empty()).count() > 1 {
+                    2
+                } else {
+                    5
+                };
+                Timer::after(Duration::from_secs(wait)).await;
+            }
+            Either::Second(()) => {
+                warn!("Wi-Fi connect `{ssid}` timed out");
+                let _ = controller.disconnect_async().await;
+                idx = j.wrapping_add(1);
+                Timer::after(Duration::from_secs(1)).await;
+            }
+        }
     }
 }
 

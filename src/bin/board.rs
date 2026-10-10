@@ -3,10 +3,18 @@
 //! MCU: ESP32-S3-WROOM-1-N8R8 (8 MB flash, 8 MB octal PSRAM).
 //! Panel: 272 × 792 B/W, dual SSD1683, 4-wire SPI.
 //!
+//! Permanent visual orientation is 180° from the panel native scan:
+//! USB-C at the top, MENU / dial / EXIT on the left. Slint (0,0) is the
+//! visual top-left in that orientation.
+//!
+//! Wi-Fi station + MCP `POST /mcp` (tool `show_text`). Credentials are
+//! compiled in from `wifi.env` or `WIFI_SSID` / `WIFI_PASSWORD`.
+//!
 //! Display SPI (FSPI):
 //! - MOSI 11, CLK 12, CS 45, DC 46, RST 47, BUSY 48, PWR 7
 //!
-//! Buttons / dial (active low, pull-up):
+//! Buttons / dial (active low, pull-up). Silkscreen names; after 180°
+//! they sit on the left:
 //! - EXIT 1, MENU 2, dial down 4, dial push 5, dial up 6
 //!
 //! Other:

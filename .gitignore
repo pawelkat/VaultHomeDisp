@@ -2,6 +2,9 @@
 debug/
 target/
 
+# Wi-Fi credentials for build.rs. Not committed.
+wifi.env
+
 # Editor configuration
 .vscode/
 .zed/

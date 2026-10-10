@@ -83,7 +83,9 @@ impl<'d, Dm: DriverMode> Epd<'d, Dm> {
         info!("SSD1683 init complete");
     }
 
-    /// `buffer` is 99 bytes × 272 rows, MSB-first, bit 1 = white paper.
+    /// `buffer` is 99 bytes × 272 rows in **panel native** scan order
+    /// (USB-C down), MSB-first, bit 1 = white paper. Callers that render
+    /// in the USB-C-up visual orientation must rotate 180° first.
     pub async fn display(&mut self, buffer: &[u8]) {
         debug_assert_eq!(buffer.len(), BUFFER_LEN);
 
@@ -116,6 +118,8 @@ impl<'d, Dm: DriverMode> Epd<'d, Dm> {
         info!("SSD1683 full refresh done");
     }
 
+    /// Park the controller. MCP leaves it awake so the next frame can refresh.
+    #[allow(dead_code)]
     pub async fn deep_sleep(&mut self) {
         self.cmd(0x10);
         self.data(0x01);

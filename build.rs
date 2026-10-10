@@ -1,4 +1,5 @@
 fn main() {
+    inject_wifi();
     linker_be_nice();
     // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
     println!("cargo:rustc-link-arg=-Tlinkall.x");
@@ -9,6 +10,62 @@ fn main() {
             .embed_resources(slint_build::EmbedResourcesKind::EmbedForSoftwareRenderer),
     )
     .unwrap();
+}
+
+fn inject_wifi() {
+    println!("cargo:rerun-if-env-changed=WIFI_SSID");
+    println!("cargo:rerun-if-env-changed=WIFI_PASSWORD");
+    println!("cargo:rerun-if-env-changed=WIFI_SSID2");
+    println!("cargo:rerun-if-env-changed=WIFI_PASSWORD2");
+    println!("cargo:rerun-if-changed=wifi.env");
+    let file = std::fs::read_to_string("wifi.env").unwrap_or_default();
+    let (ssid, password) = wifi_cred("WIFI_SSID", "WIFI_PASSWORD", &file);
+    let (ssid2, password2) = wifi_cred("WIFI_SSID2", "WIFI_PASSWORD2", &file);
+    println!("cargo:rustc-env=WIFI_SSID={ssid}");
+    println!("cargo:rustc-env=WIFI_PASSWORD={password}");
+    println!("cargo:rustc-env=WIFI_SSID2={ssid2}");
+    println!("cargo:rustc-env=WIFI_PASSWORD2={password2}");
+}
+
+fn wifi_cred(ssid_key: &str, pass_key: &str, file: &str) -> (String, String) {
+    (
+        sanitize_wifi(&first_set(ssid_key, file), 32),
+        sanitize_wifi(&first_set(pass_key, file), 64),
+    )
+}
+
+fn first_set(key: &str, file: &str) -> String {
+    if let Ok(value) = std::env::var(key) {
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    for line in file.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if k.trim() == key {
+            return v.trim().trim_matches('"').to_string();
+        }
+    }
+    String::new()
+}
+
+fn sanitize_wifi(s: &str, max_bytes: usize) -> String {
+    let mut out = String::new();
+    for c in s.chars().filter(|c| !c.is_control()) {
+        let mut buf = [0u8; 4];
+        let enc = c.encode_utf8(&mut buf);
+        if out.len() + enc.len() > max_bytes {
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn linker_be_nice() {

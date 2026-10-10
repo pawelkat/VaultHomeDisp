@@ -4,17 +4,33 @@ export component MainWindow inherits Window {
     width: 792px;
     height: 272px;
     background: #ffffff;
-    title: "crowpanel-embassy";
+    title: "VaultHomeDisp";
     default-font-family: "Liberation Sans";
+    in-out property <string> message: "";
+    in-out property <string> status: "";
 
-    Text {
-        width: 100%;
-        height: 100%;
-        text: "hi Pawel";
-        color: #000000;
-        font-family: "Liberation Sans";
-        font-size: 80px;
-        horizontal-alignment: center;
-        vertical-alignment: center;
+    VerticalLayout {
+        padding: 16px;
+        spacing: 8px;
+
+        Text {
+            text: root.message;
+            wrap: word-wrap;
+            color: #000000;
+            font-family: "Liberation Sans";
+            font-size: 36px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            vertical-stretch: 1;
+        }
+
+        Text {
+            text: root.status;
+            color: #000000;
+            font-family: "Liberation Sans";
+            font-size: 18px;
+            horizontal-alignment: center;
+            height: 28px;
+        }
     }
 }
