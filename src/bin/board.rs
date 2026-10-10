@@ -7,8 +7,9 @@
 //! USB-C at the top, MENU / dial / EXIT on the left. Slint (0,0) is the
 //! visual top-left in that orientation.
 //!
-//! Wi-Fi station + MCP `POST /mcp` (tool `show_text`). Credentials are
-//! compiled in from `wifi.env` or `WIFI_SSID` / `WIFI_PASSWORD`.
+//! Wi-Fi station + MCP `POST /mcp` (`show_text`, `show_bitmap`). Credentials
+//! are compiled in from `wifi.env` or `WIFI_SSID` / `WIFI_PASSWORD`.
+//! `show_bitmap` covers the area above the bottom status line.
 //!
 //! Display SPI (FSPI):
 //! - MOSI 11, CLK 12, CS 45, DC 46, RST 47, BUSY 48, PWR 7
@@ -16,6 +17,9 @@
 //! Buttons / dial (active low, pull-up). Silkscreen names; after 180°
 //! they sit on the left:
 //! - EXIT 1, MENU 2, dial down 4, dial push 5, dial up 6
+//!
+//! With USB-C up, silkscreen dial-down points toward the socket and
+//! silkscreen dial-up points toward the bottom. Those are previous and next.
 //!
 //! Other:
 //! - LED 41

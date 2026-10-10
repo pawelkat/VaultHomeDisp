@@ -6,6 +6,7 @@
 //! stays the same.
 
 use alloc::string::String;
+use core::sync::atomic::{AtomicU32, Ordering};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
@@ -14,6 +15,9 @@ pub const TEXT_MAX: usize = 200;
 
 pub enum PanelJob {
     Text(String),
+    /// Slot in the bitmap gallery. The bytes stay there for a later
+    /// next/previous walk; this step only shows the slot.
+    Bitmap(usize),
 }
 
 struct PanelState {
@@ -31,6 +35,11 @@ static STATE: Mutex<CriticalSectionRawMutex, PanelState> = Mutex::new(PanelState
 });
 static PENDING: Mutex<CriticalSectionRawMutex, Option<PanelJob>> = Mutex::new(None);
 static KICK: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static EPOCH: AtomicU32 = AtomicU32::new(0);
+
+pub fn epoch() -> u32 {
+    EPOCH.load(Ordering::Relaxed)
+}
 
 pub async fn set_ip(ip: String) {
     STATE.lock().await.ip = ip;
@@ -75,6 +84,7 @@ pub async fn enqueue(job: PanelJob) {
         *slot = Some(job);
     }
     STATE.lock().await.pending = true;
+    EPOCH.fetch_add(1, Ordering::Relaxed);
     KICK.signal(());
 }
 

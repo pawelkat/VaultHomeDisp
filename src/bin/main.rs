@@ -6,9 +6,11 @@
     holding buffers for the duration of a data transfer."
 )]
 #![deny(clippy::large_stack_frames)]
+#![allow(non_snake_case, reason = "the project name is VaultHomeDisp")]
 
 mod board;
 mod epd;
+mod gallery;
 mod mcp;
 mod panel;
 
@@ -131,6 +133,7 @@ async fn main(spawner: Spawner) -> ! {
     };
     esp_alloc::psram_allocator!(peripherals.PSRAM, esp_hal::psram, psram_config);
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 64 * 1024);
+    gallery::reserve().await;
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     let sw_interrupt =
@@ -200,6 +203,7 @@ async fn main(spawner: Spawner) -> ! {
             &mut line,
             "Set WIFI_SSID",
             "wifi.env",
+            None,
         )
         .await;
         button_loop(menu, exit, dial_up, dial_down, dial_push).await;
@@ -241,9 +245,16 @@ async fn main(spawner: Spawner) -> ! {
     }
     let ip = panel::ip().await;
     let url = alloc::format!("http://{ip}/mcp");
-    info!("MCP: POST {url}  tools: show_text, panel_status");
+    info!(
+        "MCP: POST {url}  tools: show_text, show_bitmap, panel_status  bitmaps {}x{} x{}",
+        gallery::WIDTH,
+        gallery::HEIGHT,
+        gallery::CAPACITY
+    );
 
     spawner.spawn(mcp::run(stack).unwrap());
+    spawner.spawn(button_task(menu, exit, dial_up, dial_down, dial_push).unwrap());
+    spawner.spawn(auto_page_task().unwrap());
 
     panel::set_refreshing(true).await;
     paint(
@@ -254,29 +265,55 @@ async fn main(spawner: Spawner) -> ! {
         &mut line,
         "MCP ready",
         &url,
+        None,
     )
     .await;
     panel::note_shown("MCP ready").await;
 
-    let mut last = [false; 5];
     loop {
-        match select(panel::wait_kick(), Timer::after(Duration::from_millis(50))).await {
-            Either::First(()) => {
-                while let Some(job) = panel::take().await {
-                    match job {
-                        PanelJob::Text(text) => {
-                            info!("panel refresh ({} chars)", text.chars().count());
-                            panel::set_refreshing(true).await;
-                            paint(&ui, &window, &mut epd, &mut packed, &mut line, &text, &url)
-                                .await;
-                            panel::note_shown(&text).await;
-                            info!("panel refresh done");
-                        }
-                    }
+        panel::wait_kick().await;
+        while let Some(job) = panel::take().await {
+            match job {
+                PanelJob::Text(text) => {
+                    info!("panel refresh ({} chars)", text.chars().count());
+                    panel::set_refreshing(true).await;
+                    paint(
+                        &ui,
+                        &window,
+                        &mut epd,
+                        &mut packed,
+                        &mut line,
+                        &text,
+                        &url,
+                        None,
+                    )
+                    .await;
+                    panel::note_shown(&text).await;
+                    info!("panel refresh done");
                 }
-            }
-            Either::Second(()) => {
-                poll_buttons(&menu, &exit, &dial_up, &dial_down, &dial_push, &mut last);
+                PanelJob::Bitmap(index) => {
+                    let Some(bitmap) = gallery::copy(index).await else {
+                        warn!("bitmap slot {index} is empty");
+                        continue;
+                    };
+                    let count = gallery::info().await.count.max(1);
+                    let status = alloc::format!("{}/{}  {url}", index + 1, count);
+                    info!("panel refresh bitmap slot {index}");
+                    panel::set_refreshing(true).await;
+                    paint(
+                        &ui,
+                        &window,
+                        &mut epd,
+                        &mut packed,
+                        &mut line,
+                        "",
+                        &status,
+                        Some(&bitmap),
+                    )
+                    .await;
+                    panel::note_shown(&alloc::format!("bitmap {index}")).await;
+                    info!("panel refresh done");
+                }
             }
         }
     }
@@ -290,6 +327,7 @@ async fn paint(
     line: &mut [Rgb565Pixel],
     message: &str,
     status: &str,
+    bitmap: Option<&[u8]>,
 ) {
     packed.fill(0xFF);
     ui.set_message(message.into());
@@ -299,8 +337,92 @@ async fn paint(
     let drawn = window.draw_if_needed(|renderer| {
         renderer.render_by_line(PackedLines { packed, line });
     });
+    if let Some(bitmap) = bitmap {
+        blit_bitmap(packed, bitmap);
+    }
     info!("slint render dirty={drawn}");
     epd.display(packed).await;
+}
+
+/// Paint a content-area bitmap in logical coordinates (USB-C up).
+/// Bit 1 is white, MSB is the left pixel. The status strip is left alone.
+fn blit_bitmap(packed: &mut [u8], bitmap: &[u8]) {
+    for y in 0..gallery::HEIGHT {
+        for x in 0..gallery::WIDTH {
+            let src = bitmap[y * gallery::STRIDE + x / 8];
+            let white = src & (1 << (7 - (x % 8))) != 0;
+            let rx = board::WIDTH - 1 - x;
+            let ry = board::HEIGHT - 1 - y;
+            let pos = (ry * board::WIDTH + rx) / 8;
+            let bit = 7 - (rx % 8);
+            if white {
+                packed[pos] |= 1 << bit;
+            } else {
+                packed[pos] &= !(1 << bit);
+            }
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn button_task(
+    menu: Input<'static>,
+    exit: Input<'static>,
+    dial_up: Input<'static>,
+    dial_down: Input<'static>,
+    dial_push: Input<'static>,
+) {
+    let mut last = [false; 5];
+    loop {
+        let now = [
+            menu.is_low(),
+            exit.is_low(),
+            dial_up.is_low(),
+            dial_down.is_low(),
+            dial_push.is_low(),
+        ];
+        const NAMES: [&str; 5] = ["MENU", "EXIT", "DIAL_UP", "DIAL_DOWN", "DIAL_PUSH"];
+        for i in 0..5 {
+            if now[i] && !last[i] {
+                info!("{} pressed", NAMES[i]);
+            }
+        }
+        // Silkscreen up points at the visual bottom (USB-C is up).
+        if now[2] && !last[2] {
+            show_step(1).await;
+        }
+        if now[3] && !last[3] {
+            show_step(-1).await;
+        }
+        last = now;
+        Timer::after(Duration::from_millis(20)).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn auto_page_task() {
+    loop {
+        let start = panel::epoch();
+        Timer::after(Duration::from_secs(gallery::AUTO_PAGE_SECS)).await;
+        if panel::epoch() != start {
+            continue;
+        }
+        if let Some(index) = gallery::advance().await {
+            info!("auto page -> slot {index}");
+            panel::enqueue(panel::PanelJob::Bitmap(index)).await;
+        }
+    }
+}
+
+async fn show_step(delta: isize) {
+    match gallery::step(delta).await {
+        Some(index) => {
+            let which = if delta > 0 { "next" } else { "previous" };
+            info!("bitmap {which} -> slot {index}");
+            panel::enqueue(panel::PanelJob::Bitmap(index)).await;
+        }
+        None => info!("bitmap step {delta} stayed put"),
+    }
 }
 
 fn poll_buttons(

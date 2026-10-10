@@ -4,6 +4,7 @@
 //! request must send it back. E-paper refresh is not done on this task.
 
 use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use embassy_futures::join::join;
 use embassy_net::Stack;
@@ -14,7 +15,13 @@ use log::{info, warn};
 use serde_json::{Value, json};
 use static_cell::StaticCell;
 
+use base64::Engine;
+
+use crate::gallery;
 use crate::panel::{self, PanelJob, TEXT_MAX};
+
+/// Headers plus one base64 bitmap, with room for line breaks in the encoding.
+const REQ_LEN: usize = 48 * 1024;
 
 const MCP_PORT: u16 = 80;
 const MAX_REQUESTS: usize = 32;
@@ -41,12 +48,12 @@ pub async fn run(stack: Stack<'static>) -> ! {
     static TX_A: StaticCell<[u8; 4096]> = StaticCell::new();
     static RX_B: StaticCell<[u8; 4096]> = StaticCell::new();
     static TX_B: StaticCell<[u8; 4096]> = StaticCell::new();
-    static REQ: StaticCell<[u8; 4096]> = StaticCell::new();
     let rx_a = RX_A.init([0; 4096]);
     let tx_a = TX_A.init([0; 4096]);
     let rx_b = RX_B.init([0; 4096]);
     let tx_b = TX_B.init([0; 4096]);
-    let req = REQ.init([0; 4096]);
+    // One bitmap is ~32 KiB of base64. Keep this in PSRAM, not next to the sockets.
+    let mut req = alloc::vec![0u8; REQ_LEN];
 
     info!("MCP listening on TCP :{MCP_PORT} (POST /mcp)");
     loop {
@@ -54,7 +61,7 @@ pub async fn run(stack: Stack<'static>) -> ! {
         if !accept_one(&mut current).await {
             continue;
         }
-        serve(&mut current, req).await;
+        serve(&mut current, &mut req).await;
 
         loop {
             let mut incoming = TcpSocket::new(stack, rx_b, tx_b);
@@ -66,7 +73,7 @@ pub async fn run(stack: Stack<'static>) -> ! {
                 drain(&mut incoming).await;
                 break;
             }
-            serve(&mut incoming, req).await;
+            serve(&mut incoming, &mut req).await;
 
             let mut current_next = TcpSocket::new(stack, rx_a, tx_a);
             arm(&mut current_next);
@@ -77,7 +84,7 @@ pub async fn run(stack: Stack<'static>) -> ! {
                 drain(&mut current_next).await;
                 break;
             }
-            serve(&mut current_next, req).await;
+            serve(&mut current_next, &mut req).await;
             current = current_next;
         }
     }
@@ -294,7 +301,7 @@ async fn handle_rpc(body: &str, headers: &str) -> RpcOut {
             "protocolVersion": protocol,
             "capabilities": { "tools": { "listChanged": false } },
             "serverInfo": { "name": "crowpanel-epaper", "version": "0.2.0" },
-            "instructions": "This server only updates the CrowPanel 5.79 inch e-paper (792x272, USB-C up, buttons on the left). show_text queues a full refresh and returns when the text is queued, not when the panel has finished. The text argument is required. If the user did not supply the text, ask them before calling. Do not invent text. A bitmap tool is not available yet."
+            "instructions": instructions(),
         });
         return RpcOut::Json {
             body: rpc_ok(id, result),
@@ -342,12 +349,52 @@ fn rpc_json(id: Value, code: i32, message: &'static str, session: Option<u32>) -
     }
 }
 
+fn instructions() -> String {
+    alloc::format!(
+        "This server only updates the CrowPanel 5.79 inch e-paper (USB-C up, buttons on the left). \
+         The content area is {}x{} pixels. The bottom {} rows are the connectivity status and are not part of a bitmap. \
+         show_text and show_bitmap queue a full refresh and return when the frame is queued, not when the panel has finished. \
+         show_bitmap takes one monochrome bitmap ({} bytes, base64) and the panel can store {} of them. \
+         Do not invent text or pixel data. The dial on the left moves between stored bitmaps: toward the bottom is next, toward the USB-C socket is previous.",
+        gallery::WIDTH,
+        gallery::HEIGHT,
+        gallery::STATUS_H,
+        gallery::BYTES,
+        gallery::CAPACITY
+    )
+}
+
 fn tools_list() -> Value {
+    let text_desc = alloc::format!(
+        "Display text on the CrowPanel content area ({}x{} above a {} pixel status line). \
+         Orientation is USB-C up, buttons on the left. The call queues a full refresh and returns immediately. \
+         The text argument is required. If the user did not specify the text, ask them. Do not invent text.",
+        gallery::WIDTH,
+        gallery::HEIGHT,
+        gallery::STATUS_H
+    );
+    let bitmap_desc = alloc::format!(
+        "Store and display one monochrome bitmap. Advertised size is {}x{} (stride {} bytes, {} bytes total). \
+         The full panel is {}x{}; the bottom {} rows are the connectivity status and must not be included. \
+         Encoding: row-major, MSB is the leftmost pixel, 1 = white, 0 = black. Pass the raw bytes as standard base64 in data. \
+         The panel reserves {} bytes and can store {} bitmaps. Omit index to append; pass index to overwrite that slot. \
+         The call returns when the bitmap is stored and the refresh is queued. Do not invent pixel data. \
+         The dial walks the stored slots: bottom is next, USB-C is previous. A press at either end does nothing.",
+        gallery::WIDTH,
+        gallery::HEIGHT,
+        gallery::STRIDE,
+        gallery::BYTES,
+        board_width(),
+        board_height(),
+        gallery::STATUS_H,
+        gallery::CAPACITY * gallery::BYTES,
+        gallery::CAPACITY
+    );
     json!({
         "tools": [
             {
                 "name": "show_text",
-                "description": "Display text on the CrowPanel 5.79 inch e-paper. Orientation is USB-C up, buttons on the left, 792x272 black and white. The call queues a full refresh and returns immediately; the panel takes several seconds to finish. This only updates the panel. The text argument is required. If the user did not specify the text, ask them, then call this tool. Do not invent text.",
+                "description": text_desc,
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -363,8 +410,33 @@ fn tools_list() -> Value {
                 }
             },
             {
+                "name": "show_bitmap",
+                "description": bitmap_desc,
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "data": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": alloc::format!(
+                                "Standard base64 of exactly {} raw bytes ({}x{}, stride {}).",
+                                gallery::BYTES, gallery::WIDTH, gallery::HEIGHT, gallery::STRIDE
+                            )
+                        },
+                        "index": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": gallery::CAPACITY - 1,
+                            "description": "Slot to overwrite. Omit to append the next free slot."
+                        }
+                    },
+                    "required": ["data"],
+                    "additionalProperties": false
+                }
+            },
+            {
                 "name": "panel_status",
-                "description": "Read the CrowPanel MCP status: IP, whether a refresh is running, and the last text queued. Does not change the panel.",
+                "description": "Read IP, refresh state, bitmap size, and how many bitmaps are stored. Does not change the panel.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {},
@@ -373,6 +445,13 @@ fn tools_list() -> Value {
             }
         ]
     })
+}
+
+fn board_width() -> usize {
+    crate::board::WIDTH
+}
+fn board_height() -> usize {
+    crate::board::HEIGHT
 }
 
 async fn call_tool(req: &Value) -> Result<Value, String> {
@@ -402,25 +481,132 @@ async fn call_tool(req: &Value) -> Result<Value, String> {
                 }]
             }))
         }
+        "show_bitmap" => {
+            let Some(raw) = tool_data(req) else {
+                return Err(
+                    "Bitmap data is missing. Ask the user for a monochrome bitmap, then call show_bitmap with its base64 in data."
+                        .into(),
+                );
+            };
+            let bytes = decode_bitmap(raw)?;
+            let index = bitmap_index(req)?;
+            if tool_flag(req, "replace") {
+                gallery::begin_set().await;
+            }
+            let slot = match gallery::store(index, &bytes).await {
+                Ok(slot) => slot,
+                Err("bitmap store is full") => {
+                    return Err(alloc::format!(
+                        "Bitmap store is full ({}/{}). Pass index to overwrite a slot, or step with the dial.",
+                        gallery::CAPACITY,
+                        gallery::CAPACITY
+                    ));
+                }
+                Err("bitmap index is out of range") => {
+                    return Err(alloc::format!(
+                        "Bitmap index is out of range. Slots are 0..{}.",
+                        gallery::CAPACITY - 1
+                    ));
+                }
+                Err(msg) => return Err(msg.into()),
+            };
+            let info = gallery::info().await;
+            info!(
+                "MCP show_bitmap slot {slot} ({}/{})",
+                info.count, info.capacity
+            );
+            panel::enqueue(PanelJob::Bitmap(slot)).await;
+            Ok(json!({
+                "content": [{
+                    "type": "text",
+                    "text": alloc::format!(
+                        "Stored bitmap in slot {slot} ({}/{}). Size {}x{}, stride {}, {} bytes, 1=white 0=black. Full refresh queued.",
+                        info.count,
+                        info.capacity,
+                        gallery::WIDTH,
+                        gallery::HEIGHT,
+                        gallery::STRIDE,
+                        gallery::BYTES
+                    )
+                }]
+            }))
+        }
         "panel_status" => {
             let status = panel::status().await;
+            let info = gallery::info().await;
             let url = if status.ip.is_empty() {
                 "http://<no-ip>/mcp".to_string()
             } else {
                 alloc::format!("http://{}/mcp", status.ip)
             };
+            let shown = info
+                .shown
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".into());
             let text = alloc::format!(
-                "url: {url}\norientation: USB-C up, buttons left\nrefreshing: {}\npending: {}\nlast: {}",
+                "url: {url}\norientation: USB-C up, buttons left\nrefreshing: {}\npending: {}\nlast: {}\nbitmap: {}x{} stride {} bytes {} (1=white, 0=black, MSB left)\nstored: {}/{}\nshown: {shown}\nstatus_rows: {}",
                 status.refreshing,
                 status.pending,
-                status.last_text
+                status.last_text,
+                gallery::WIDTH,
+                gallery::HEIGHT,
+                gallery::STRIDE,
+                gallery::BYTES,
+                info.count,
+                info.capacity,
+                gallery::STATUS_H
             );
             Ok(json!({
                 "content": [{"type": "text", "text": text}]
             }))
         }
-        _ => Err("Unknown tool. Use show_text or panel_status.".into()),
+        _ => Err("Unknown tool. Use show_text, show_bitmap, or panel_status.".into()),
     }
+}
+
+fn tool_flag(req: &Value, name: &str) -> bool {
+    req.pointer(&alloc::format!("/params/arguments/{name}"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn tool_data(req: &Value) -> Option<&str> {
+    req.pointer("/params/arguments/data")
+        .and_then(Value::as_str)
+}
+
+fn bitmap_index(req: &Value) -> Result<Option<usize>, String> {
+    let Some(value) = req.pointer("/params/arguments/index") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let Some(index) = value.as_u64() else {
+        return Err("index must be a non-negative integer.".into());
+    };
+    Ok(Some(index as usize))
+}
+
+fn decode_bitmap(data: &str) -> Result<Vec<u8>, String> {
+    let cleaned: Vec<u8> = data
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(cleaned)
+        .map_err(|_| "Bitmap data is not valid standard base64.".to_string())?;
+    if bytes.len() != gallery::BYTES {
+        return Err(alloc::format!(
+            "Bitmap is {} bytes after base64. It must be exactly {} bytes ({}x{}, stride {}).",
+            bytes.len(),
+            gallery::BYTES,
+            gallery::WIDTH,
+            gallery::HEIGHT,
+            gallery::STRIDE
+        ));
+    }
+    Ok(bytes)
 }
 
 fn tool_text(req: &Value) -> Option<&str> {
@@ -519,7 +705,10 @@ async fn help_text() -> String {
         ip.as_str()
     };
     alloc::format!(
-        "crowpanel MCP\nPOST http://{host}/mcp\ntools: show_text, panel_status\nshow_text requires text; ask the user if missing\n"
+        "VaultHomeDisp MCP\nPOST http://{host}/mcp\ntools: show_text, show_bitmap, panel_status\nbitmap {}x{} x{} slots\n",
+        gallery::WIDTH,
+        gallery::HEIGHT,
+        gallery::CAPACITY,
     )
 }
 
