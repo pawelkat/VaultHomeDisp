@@ -10,6 +10,10 @@ autobins     = false
 name = "VaultHomeDisp"
 path = "./src/bin/main.rs"
 
+[[bin]]
+name = "x4"
+path = "./src/bin/x4/main.rs"
+
 [dependencies]
 esp-hal = { version = "~1.1.0", features = ["esp32s3", "log-04", "unstable"] }
 
