@@ -1,10 +1,14 @@
 //! XTEINK X4 Classic (ESP32-S3, 16 MB flash, 8 MB octal PSRAM).
 //!
-//! Pins from FreeInk `XTEINK_X4_CLASSIC` (MIT). Not checked on this unit yet.
-//! The glass is 800×480 in its native scan. Portrait 480×800 is a later rotation.
+//! Pins from FreeInk `XTEINK_X4_CLASSIC` (MIT).
+//! The controller scans 800×480 landscape. Reading orientation is portrait
+//! 480×800: a native image looks rotated 90° clockwise when the long edge
+//! is vertical, so portrait (x, y) is stored at native (y, 479 − x).
 
 pub const NATIVE_WIDTH: usize = 800;
 pub const NATIVE_HEIGHT: usize = 480;
+pub const VIEW_WIDTH: usize = 480;
+pub const VIEW_HEIGHT: usize = 800;
 
 pub const GPIO_PWR: u8 = 1;
 pub const GPIO_PREV: u8 = 0;
