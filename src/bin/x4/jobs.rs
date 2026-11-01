@@ -6,7 +6,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::signal::Signal;
 
-pub const TEXT_MAX: usize = 800;
+pub const TEXT_MAX: usize = 32_000;
 
 pub enum Job {
     Frame(Vec<u8>),

@@ -21,7 +21,7 @@ use crate::jobs::{self, Job, TEXT_MAX};
 use crate::text;
 
 /// One portrait bitmap is 64 KiB of base64, plus the JSON wrapper.
-const REQ_LEN: usize = 80 * 1024;
+const REQ_LEN: usize = 128 * 1024;
 
 const MCP_PORT: u16 = 80;
 const MAX_REQUESTS: usize = 32;
@@ -330,10 +330,11 @@ fn rpc_json(id: Value, code: i32, message: &'static str, session: Option<u32>) -
 fn instructions() -> String {
     alloc::format!(
         "This server updates the XTEINK X4 Classic e-paper. The page is portrait {}x{} pixels. \
+         show_text lays out markdown on the device (headings, bullets, paragraphs, wikilink names) \
+         and the side keys scroll the pages: up is previous, down is next, and a press at either end stays put. \
          show_text and show_bitmap queue a full refresh and return before the glass has finished. \
-         A page takes several seconds: the pixels are copied one bit at a time, then the panel runs \
-         its own 1 second waveform. show_bitmap takes one monochrome bitmap ({} bytes, base64). \
-         The panel stores {} of them. 1 = white, 0 = black, MSB is the left pixel. \
+         A page takes several seconds. show_bitmap takes one monochrome bitmap ({} bytes, base64). \
+         The panel stores {} pages. 1 = white, 0 = black, MSB is the left pixel. \
          Do not invent text or pixel data.",
         gallery::WIDTH,
         gallery::HEIGHT,
@@ -344,8 +345,10 @@ fn instructions() -> String {
 
 fn tools_list() -> Value {
     let text_desc = alloc::format!(
-        "Display text on the X4 in portrait ({}x{}). The call queues a full refresh and returns immediately. \
-         The text argument is required. Newlines are kept. Do not invent text.",
+        "Lay out markdown on the X4 in portrait ({}x{}) and show the first page. \
+         Headings, bullets, paragraphs, and wikilink visible names are kept. Links are not selectable. \
+         The side key up moves to the previous page and side key down to the next. A press at either end stays on that page. \
+         The call queues a full refresh and returns immediately. The text argument is required. Do not invent text.",
         gallery::WIDTH, gallery::HEIGHT
     );
     let bitmap_desc = alloc::format!(
@@ -440,14 +443,27 @@ async fn call_tool(req: &Value) -> Result<Value, String> {
                 ));
             }
             info!("MCP show_text queued ({} chars)", text.chars().count());
-            let frame = text::render(&text);
+            let pages = text::render_pages(&text);
+            let count = pages.len();
+            gallery::begin_set().await;
+            for (index, page) in pages.iter().enumerate() {
+                if let Err(msg) = gallery::store(Some(index), page).await {
+                    return Err(msg.into());
+                }
+            }
+            gallery::mark_shown(0).await;
             let label: String = text.chars().take(80).collect();
-            jobs::enqueue(Job::Frame(frame), &label).await;
+            jobs::enqueue(Job::Slot(0), &label).await;
+            let cut = if count >= gallery::CAPACITY {
+                " The note was cut at the page limit."
+            } else {
+                ""
+            };
             Ok(json!({
                 "content": [{
                     "type": "text",
                     "text": alloc::format!(
-                        "Queued on the X4 ({}x{} portrait). The glass updates after the pixel copy and the waveform.\n{text}",
+                        "Queued {count} page(s) on the X4 ({}x{} portrait). Side up is the previous page, side down is the next.{cut}",
                         gallery::WIDTH, gallery::HEIGHT
                     )
                 }]

@@ -139,7 +139,13 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
     let mut announced = false;
     let mut last = [false; 7];
     loop {
-        poll_buttons(&prev, &next, &left, &right, &confirm, &back, &power, &mut last);
+        let (page_prev, page_next) =
+            poll_buttons(&prev, &next, &left, &right, &confirm, &back, &power, &mut last);
+        if page_prev {
+            turn_page(&mut epd, -1).await;
+        } else if page_next {
+            turn_page(&mut epd, 1).await;
+        }
         if !announced {
             if let Some(ip) = net::ipv4(stack) {
                 jobs::set_ip(ip.clone()).await;
@@ -180,7 +186,7 @@ fn poll_buttons(
     back: &Input<'_>,
     power: &Input<'_>,
     last: &mut [bool; 7],
-) {
+) -> (bool, bool) {
     let now = [
         prev.is_low(),
         next.is_low(),
@@ -196,7 +202,25 @@ fn poll_buttons(
             info!("{} pressed", NAMES[i]);
         }
     }
+    let edges = (now[0] && !last[0], now[1] && !last[1]);
     *last = now;
+    edges
+}
+
+/// Side up is the previous page. Side down is the next page. Either end stays put.
+async fn turn_page(epd: &mut panel::Panel<'_>, delta: isize) {
+    match gallery::step(delta).await {
+        Some(slot) => {
+            let which = if delta > 0 { "next" } else { "previous" };
+            info!("X4 page {which} -> slot {slot}");
+            jobs::set_refreshing(true).await;
+            if let Some(frame) = gallery::copy(slot).await {
+                epd.refresh_portrait(&frame).await;
+            }
+            jobs::set_refreshing(false).await;
+        }
+        None => info!("X4 page step {delta} stayed put"),
+    }
 }
 
 async fn button_loop(

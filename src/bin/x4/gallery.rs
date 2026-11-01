@@ -10,7 +10,7 @@ pub const WIDTH: usize = board::VIEW_WIDTH;
 pub const HEIGHT: usize = board::VIEW_HEIGHT;
 pub const STRIDE: usize = WIDTH / 8;
 pub const BYTES: usize = STRIDE * HEIGHT;
-pub const CAPACITY: usize = 8;
+pub const CAPACITY: usize = 24;
 
 struct Gallery {
     buf: Vec<u8>,
@@ -92,6 +92,38 @@ pub async fn store(index: Option<usize>, bytes: &[u8]) -> Result<usize, &'static
     gallery.buf[start..start + BYTES].copy_from_slice(bytes);
     gallery.shown = Some(slot);
     Ok(slot)
+}
+
+pub async fn mark_shown(slot: usize) {
+    let mut gallery = GALLERY.lock().await;
+    if slot < gallery.count {
+        gallery.shown = Some(slot);
+    }
+}
+
+/// Move one page toward the start or the end. `None` when there is nothing
+/// stored, or the shown page is already at that end.
+pub async fn step(delta: isize) -> Option<usize> {
+    if delta == 0 {
+        return None;
+    }
+    let mut gallery = GALLERY.lock().await;
+    if gallery.count == 0 {
+        return None;
+    }
+    let current = gallery.shown.unwrap_or(0).min(gallery.count - 1);
+    let next = if delta > 0 {
+        current
+            .saturating_add(delta as usize)
+            .min(gallery.count - 1)
+    } else {
+        current.saturating_sub(delta.unsigned_abs())
+    };
+    if gallery.shown == Some(next) {
+        return None;
+    }
+    gallery.shown = Some(next);
+    Some(next)
 }
 
 pub async fn copy(slot: usize) -> Option<Vec<u8>> {
