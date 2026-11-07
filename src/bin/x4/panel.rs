@@ -153,6 +153,13 @@ impl<'d> Panel<'d> {
         info!("X4 UC8279 power off saw_busy={off_low} idle={off}");
     }
 
+    /// Controller deep sleep. The image stays on the glass. The next refresh
+    /// resets the chip, which is the only way out of this command.
+    pub fn sleep_controller(&mut self) {
+        info!("X4 panel controller sleep");
+        self.command_bytes(0x07, &[0xA5]);
+    }
+
     pub async fn show_uc8279_mark(&mut self) {
         let mut frame =
             alloc::vec![0xFFu8; crate::board::VIEW_WIDTH * crate::board::VIEW_HEIGHT / 8];

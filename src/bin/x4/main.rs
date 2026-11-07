@@ -1,33 +1,28 @@
 #![no_std]
 #![no_main]
 
+mod ble;
 mod board;
-mod font;
 mod gallery;
 mod jobs;
-mod mcp;
-mod net;
 mod panel;
 mod text;
 
 use embassy_futures::select::{Either, select};
-use embassy_net::{Config, StackResources};
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
-use esp_hal::gpio::{Flex, Input, InputConfig, Level, Output, OutputConfig, Pull};
-use esp_hal::rng::Rng;
+use esp_hal::gpio::{Flex, Input, InputConfig, Level, Output, OutputConfig, Pull, RtcPinWithResistors};
+use esp_hal::rtc_cntl::sleep::{Ext1WakeupSource, WakeupLevel};
+use esp_hal::rtc_cntl::Rtc;
 use esp_hal::timer::timg::TimerGroup;
 use jobs::Job;
 use log::{error, info};
 use panel::Controller;
-use static_cell::StaticCell;
 
 extern crate alloc;
 
 esp_bootloader_esp_idf::esp_app_desc!();
-
-static STACK_RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
 
 #[esp_rtos::main]
 async fn main(spawner: embassy_executor::Spawner) -> ! {
@@ -53,19 +48,22 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         board::VIEW_HEIGHT
     );
 
-    let _rail = Output::new(peripherals.GPIO1, Level::High, OutputConfig::default());
+    let mut rail = Output::new(peripherals.GPIO1, Level::High, OutputConfig::default());
     // SD power is active-low. Hold it off until the card driver exists.
     let _sd_off = Output::new(peripherals.GPIO6, Level::High, OutputConfig::default());
     Timer::after(Duration::from_millis(80)).await;
 
     let pull_up = InputConfig::default().with_pull(Pull::Up);
-    let prev = Input::new(peripherals.GPIO0, pull_up);
-    let next = Input::new(peripherals.GPIO7, pull_up);
-    let left = Input::new(peripherals.GPIO5, pull_up);
-    let right = Input::new(peripherals.GPIO2, pull_up);
-    let confirm = Input::new(peripherals.GPIO8, pull_up);
-    let back = Input::new(peripherals.GPIO9, pull_up);
-    let power = Input::new(peripherals.GPIO3, pull_up);
+    let mut rtc = Rtc::new(peripherals.LPWR);
+    let mut keys = Keys {
+        prev: peripherals.GPIO0,
+        next: peripherals.GPIO7,
+        left: peripherals.GPIO5,
+        right: peripherals.GPIO2,
+        confirm: peripherals.GPIO8,
+        back: peripherals.GPIO9,
+        power: peripherals.GPIO3,
+    };
 
     let mut mosi = Flex::new(peripherals.GPIO11);
     mosi.apply_output_config(&OutputConfig::default());
@@ -100,80 +98,85 @@ async fn main(spawner: embassy_executor::Spawner) -> ! {
         }
     };
 
-    if !uc8279 || !net::ssid_ready() {
-        if uc8279 && !net::ssid_ready() {
-            error!("WIFI_SSID is empty. Rebuild with wifi.env");
-            epd.show_uc8279_mark().await;
-        }
+    if !uc8279 {
+        let prev = Input::new(keys.prev.reborrow(), pull_up);
+        let next = Input::new(keys.next.reborrow(), pull_up);
+        let left = Input::new(keys.left.reborrow(), pull_up);
+        let right = Input::new(keys.right.reborrow(), pull_up);
+        let confirm = Input::new(keys.confirm.reborrow(), pull_up);
+        let back = Input::new(keys.back.reborrow(), pull_up);
+        let power = Input::new(keys.power.reborrow(), pull_up);
         button_loop(prev, next, left, right, confirm, back, power).await;
     }
 
-    let rng = Rng::new();
-    let r1 = rng.random();
-    let r2 = rng.random();
-    mcp::seed_session(r1 ^ r2);
-    let seed = (r1 as u64) << 32 | r2 as u64;
-
-    let (wifi_controller, interfaces) = esp_radio::wifi::new(peripherals.WIFI, Default::default())
-        .expect("Failed to initialize Wi-Fi controller");
-    let (stack, runner) = embassy_net::new(
-        interfaces.station,
-        Config::dhcpv4(Default::default()),
-        STACK_RESOURCES.init(StackResources::new()),
-        seed,
-    );
-    spawner.spawn(net::net_task(runner).unwrap());
-    spawner.spawn(net::wifi_task(wifi_controller).unwrap());
-    spawner.spawn(mcp::run(stack).unwrap());
-
-    if net::fallback_ssid().is_empty() {
-        info!("Connecting to SSID `{}` ...", net::primary_ssid());
-    } else {
-        info!(
-            "Connecting to SSID `{}` (fallback `{}`)",
-            net::primary_ssid(),
-            net::fallback_ssid()
-        );
+    // Wi-Fi and MCP stay off on this binary. The controller then gets its
+    // default 8 KB task stack, which did not fit beside the Wi-Fi tasks.
+    let ble_config = esp_radio::ble::Config::default();
+    match esp_radio::ble::controller::BleConnector::new(peripherals.BT, ble_config) {
+        Ok(connector) => {
+            spawner.spawn(ble::run(connector).unwrap());
+        }
+        Err(err) => error!("X4 BLE init failed: {err:?}"),
     }
 
-    let mut announced = false;
-    let mut last = [false; 7];
+    info!("Hold the power key for 2 seconds to sleep. Any key wakes the reader.");
+    jobs::enqueue(
+        Job::Frame(text::render("X4\nBLE\nVaultHome X4")),
+        "ble",
+    )
+    .await;
+
+    let mut power_since: Option<Instant> = None;
     loop {
-        let (page_prev, page_next) =
-            poll_buttons(&prev, &next, &left, &right, &confirm, &back, &power, &mut last);
-        if page_prev {
-            turn_page(&mut epd, -1).await;
-        } else if page_next {
-            turn_page(&mut epd, 1).await;
-        }
-        if !announced {
-            if let Some(ip) = net::ipv4(stack) {
-                jobs::set_ip(ip.clone()).await;
-                let url = alloc::format!("http://{ip}/mcp");
-                info!("MCP: POST {url}  tools: show_text, show_bitmap, panel_status");
-                let page = text::render(&alloc::format!("X4\n{url}"));
-                jobs::enqueue(Job::Frame(page), &url).await;
-                announced = true;
+        let prev = Input::new(keys.prev.reborrow(), pull_up);
+        let next = Input::new(keys.next.reborrow(), pull_up);
+        let left = Input::new(keys.left.reborrow(), pull_up);
+        let right = Input::new(keys.right.reborrow(), pull_up);
+        let confirm = Input::new(keys.confirm.reborrow(), pull_up);
+        let back = Input::new(keys.back.reborrow(), pull_up);
+        let power = Input::new(keys.power.reborrow(), pull_up);
+        let mut last = [false; 7];
+        let sleeping = loop {
+            let (page_prev, page_next) =
+                poll_buttons(&prev, &next, &left, &right, &confirm, &back, &power, &mut last);
+            if power.is_low() {
+                let start = *power_since.get_or_insert_with(Instant::now);
+                if start.elapsed() >= Duration::from_secs(2) {
+                    break true;
+                }
+            } else {
+                power_since = None;
             }
-        }
-        while let Some(job) = jobs::take().await {
-            jobs::set_refreshing(true).await;
-            match job {
-                Job::Frame(frame) => epd.refresh_portrait(&frame).await,
-                Job::Slot(slot) => {
-                    info!("X4 show stored slot {slot}");
-                    if let Some(frame) = gallery::copy(slot).await {
-                        epd.refresh_portrait(&frame).await;
-                    } else {
-                        info!("X4 slot {slot} is empty");
+            if page_prev {
+                turn_page(&mut epd, -1).await;
+            } else if page_next {
+                turn_page(&mut epd, 1).await;
+            }
+            while let Some(job) = jobs::take().await {
+                jobs::set_refreshing(true).await;
+                match job {
+                    Job::Frame(frame) => epd.refresh_portrait(&frame).await,
+                    Job::Slot(slot) => {
+                        info!("X4 show stored slot {slot}");
+                        if let Some(frame) = gallery::copy(slot).await {
+                            epd.refresh_portrait(&frame).await;
+                        } else {
+                            info!("X4 slot {slot} is empty");
+                        }
                     }
                 }
+                jobs::set_refreshing(false).await;
             }
-            jobs::set_refreshing(false).await;
+            match select(jobs::wait(), Timer::after(Duration::from_millis(20))).await {
+                Either::First(()) | Either::Second(()) => {}
+            }
+        };
+        if !sleeping {
+            continue;
         }
-        match select(jobs::wait(), Timer::after(Duration::from_millis(20))).await {
-            Either::First(()) | Either::Second(()) => {}
-        }
+        drop((prev, next, left, right, confirm, back, power));
+        sleep_until_any_key(&mut rtc, &mut keys, &mut rail, &mut epd).await;
+        power_since = None;
     }
 }
 
@@ -221,6 +224,143 @@ async fn turn_page(epd: &mut panel::Panel<'_>, delta: isize) {
         }
         None => info!("X4 page step {delta} stayed put"),
     }
+}
+
+struct Keys<'d> {
+    prev: esp_hal::peripherals::GPIO0<'d>,
+    next: esp_hal::peripherals::GPIO7<'d>,
+    left: esp_hal::peripherals::GPIO5<'d>,
+    right: esp_hal::peripherals::GPIO2<'d>,
+    confirm: esp_hal::peripherals::GPIO8<'d>,
+    back: esp_hal::peripherals::GPIO9<'d>,
+    power: esp_hal::peripherals::GPIO3<'d>,
+}
+
+/// Light sleep. PSRAM stays powered, so stored pages are still there on wake.
+/// Any of the seven keys wakes the reader. The glass keeps its image.
+async fn sleep_until_any_key(
+    rtc: &mut Rtc<'_>,
+    keys: &mut Keys<'_>,
+    rail: &mut Output<'_>,
+    epd: &mut panel::Panel<'_>,
+) {
+    info!("X4 power off. Release the key.");
+    show_power_mark(epd, false).await;
+    epd.sleep_controller();
+    rail.set_low();
+    {
+        let sense = Input::new(keys.power.reborrow(), InputConfig::default().with_pull(Pull::Up));
+        while sense.is_low() {
+            Timer::after(Duration::from_millis(20)).await;
+        }
+    }
+    Timer::after(Duration::from_millis(80)).await;
+
+    info!("X4 light sleep. Any key wakes.");
+    keys.prev.rtcio_pullup(true);
+    keys.next.rtcio_pullup(true);
+    keys.left.rtcio_pullup(true);
+    keys.right.rtcio_pullup(true);
+    keys.confirm.rtcio_pullup(true);
+    keys.back.rtcio_pullup(true);
+    keys.power.rtcio_pullup(true);
+    let mut wake_pins: [&mut dyn esp_hal::gpio::RtcPin; 7] = [
+        &mut keys.prev,
+        &mut keys.next,
+        &mut keys.left,
+        &mut keys.right,
+        &mut keys.confirm,
+        &mut keys.back,
+        &mut keys.power,
+    ];
+    let wake = Ext1WakeupSource::new(&mut wake_pins, WakeupLevel::Low);
+    rtc.sleep_light(&[&wake]);
+    drop(wake);
+
+    let pull = InputConfig::default().with_pull(Pull::Up);
+    let prev = Input::new(keys.prev.reborrow(), pull);
+    let next = Input::new(keys.next.reborrow(), pull);
+    let left = Input::new(keys.left.reborrow(), pull);
+    let right = Input::new(keys.right.reborrow(), pull);
+    let confirm = Input::new(keys.confirm.reborrow(), pull);
+    let back = Input::new(keys.back.reborrow(), pull);
+    let power = Input::new(keys.power.reborrow(), pull);
+    while prev.is_low()
+        || next.is_low()
+        || left.is_low()
+        || right.is_low()
+        || confirm.is_low()
+        || back.is_low()
+        || power.is_low()
+    {
+        Timer::after(Duration::from_millis(20)).await;
+    }
+    drop((prev, next, left, right, confirm, back, power));
+    rail.set_high();
+    Timer::after(Duration::from_millis(80)).await;
+    info!("X4 power on. Stored pages are still in memory.");
+    show_power_mark(epd, true).await;
+}
+
+/// Paint a small power mark in the top-right of the page that is already showing.
+/// `on` is a filled mark. Off is the open power symbol, and that picture stays
+/// on the glass while the reader sleeps.
+async fn show_power_mark(epd: &mut panel::Panel<'_>, on: bool) {
+    let mut frame = match gallery::info().await.shown {
+        Some(slot) => gallery::copy(slot).await.unwrap_or_else(white_frame),
+        None => white_frame(),
+    };
+    stamp_power(&mut frame, on);
+    epd.refresh_portrait(&frame).await;
+}
+
+fn white_frame() -> alloc::vec::Vec<u8> {
+    alloc::vec![0xFFu8; gallery::BYTES]
+}
+
+fn stamp_power(frame: &mut [u8], on: bool) {
+    let cx = gallery::WIDTH as i32 - 28;
+    let cy = 32;
+    let radius = 11;
+    if on {
+        disc(frame, cx, cy, radius, true);
+        return;
+    }
+    disc(frame, cx, cy, radius, false);
+    for y in (cy - radius - 6)..=(cy - 2) {
+        for x in (cx - 1)..=(cx + 1) {
+            ink(frame, x, y);
+        }
+    }
+}
+
+fn disc(frame: &mut [u8], cx: i32, cy: i32, radius: i32, filled: bool) {
+    let inner = radius - 2;
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            let dist = dx * dx + dy * dy;
+            let draw = if filled {
+                dist <= radius * radius
+            } else {
+                dist <= radius * radius && dist >= inner * inner
+            };
+            // Leave a gap at the top of the outline so the stem reads as a power symbol.
+            let gap = !filled && dy < -radius / 2 && dx.abs() <= 2;
+            if draw && !gap {
+                ink(frame, cx + dx, cy + dy);
+            }
+        }
+    }
+}
+
+fn ink(frame: &mut [u8], x: i32, y: i32) {
+    if x < 0 || y < 0 || x >= gallery::WIDTH as i32 || y >= gallery::HEIGHT as i32 {
+        return;
+    }
+    let x = x as usize;
+    let y = y as usize;
+    let index = y * gallery::STRIDE + x / 8;
+    frame[index] &= !(0x80 >> (x % 8));
 }
 
 async fn button_loop(

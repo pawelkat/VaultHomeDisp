@@ -10,7 +10,7 @@ pub const WIDTH: usize = board::VIEW_WIDTH;
 pub const HEIGHT: usize = board::VIEW_HEIGHT;
 pub const STRIDE: usize = WIDTH / 8;
 pub const BYTES: usize = STRIDE * HEIGHT;
-pub const CAPACITY: usize = 24;
+pub const CAPACITY: usize = 32;
 
 struct Gallery {
     buf: Vec<u8>,

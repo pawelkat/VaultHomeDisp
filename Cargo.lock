@@ -11,6 +11,7 @@ dependencies = [
  "embassy-executor",
  "embassy-futures",
  "embassy-net",
+ "embassy-sync 0.7.2",
  "embassy-sync 0.8.0",
  "embassy-time",
  "embedded-io-async 0.7.0",
@@ -21,12 +22,15 @@ dependencies = [
  "esp-println",
  "esp-radio",
  "esp-rtos",
+ "fontdue",
+ "heapless 0.9.3",
  "log",
  "serde",
  "serde_json",
  "slint",
  "slint-build",
  "static_cell",
+ "trouble-host",
 ]
 
 [[package]]
@@ -504,6 +508,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "bt-hci"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "211713d2e9fb4793ce4360a712c0764264aff6be48932ccf02ca2a331c0436a9"
+dependencies = [
+ "btuuid",
+ "embassy-sync 0.8.0",
+ "embedded-io 0.7.1",
+ "embedded-io-async 0.7.0",
+ "futures-intrusive",
+ "heapless 0.9.3",
+]
+
+[[package]]
+name = "btuuid"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5f48f1e9b0aad0a4f05d17bdeae0fa20ff798e272a03a6940ca27ad9c5a6ae7"
+dependencies = [
+ "uuid",
+]
+
+[[package]]
 name = "built"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -720,6 +747,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.5",
+]
+
+[[package]]
+name = "convert_case"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "baaaa0ecca5b51987b9423ccdc971514dd8b0bb7b4060b983d3664dad3f1f89f"
+dependencies = [
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -1045,7 +1081,7 @@ version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "799a97264921d8623a957f6c3b9011f3b5492f557bbb7a5a19b7fa6d06ba8dcb"
 dependencies = [
- "convert_case",
+ "convert_case 0.10.0",
  "proc-macro2",
  "quote",
  "rustc_version",
@@ -1747,6 +1783,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23fbff98b06a96b6ce3791ecec5c668524052a068e23aacd23afe17ddba844ce"
 dependencies = [
  "allocator-api2 0.3.1",
+ "bt-hci",
  "cfg-if",
  "docsplay",
  "document-features",
@@ -2117,6 +2154,12 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "foldhash"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
+name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
@@ -2148,6 +2191,16 @@ dependencies = [
  "log",
  "slotmap",
  "tinyvec",
+ "ttf-parser",
+]
+
+[[package]]
+name = "fontdue"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e796cb6894e6418daacea84b28dd4f98d3b32c74d5bb452ba1ecfbf5ad8e84ca"
+dependencies = [
+ "hashbrown 0.15.5",
  "ttf-parser",
 ]
 
@@ -2258,6 +2311,16 @@ dependencies = [
  "futures-core",
  "futures-task",
  "futures-util",
+]
+
+[[package]]
+name = "futures-intrusive"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d930c203dd0b6ff06e0201a4a2fe9149b43c684fd4420555b26d21b1a02956f"
+dependencies = [
+ "futures-core",
+ "lock_api",
 ]
 
 [[package]]
@@ -2509,13 +2572,24 @@ checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 
 [[package]]
 name = "hashbrown"
+version = "0.15.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
+dependencies = [
+ "allocator-api2 0.2.21",
+ "equivalent",
+ "foldhash 0.1.5",
+]
+
+[[package]]
+name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
  "allocator-api2 0.2.21",
  "equivalent",
- "foldhash",
+ "foldhash 0.2.0",
 ]
 
 [[package]]
@@ -3409,6 +3483,15 @@ name = "litrs"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
+
+[[package]]
+name = "lock_api"
+version = "0.4.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
+dependencies = [
+ "scopeguard",
+]
 
 [[package]]
 name = "log"
@@ -5824,6 +5907,40 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "trouble-host"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1df7817cead4b83dfbeeaa59736ecbc97c30b21dc3bfc0cc2ce8a6687f70b37a"
+dependencies = [
+ "bt-hci",
+ "embassy-futures",
+ "embassy-sync 0.7.2",
+ "embassy-time",
+ "embedded-io 0.7.1",
+ "futures",
+ "heapless 0.9.3",
+ "log",
+ "rand_core 0.6.4",
+ "static_cell",
+ "trouble-host-macros",
+ "zerocopy",
+]
+
+[[package]]
+name = "trouble-host-macros"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d809ae05f510cf8f1d863749281eb28e049d9ae4ad52d92ea7a0ac068a0e17c"
+dependencies = [
+ "convert_case 0.8.0",
+ "darling 0.20.11",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "uuid",
 ]
 
 [[package]]

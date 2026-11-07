@@ -25,11 +25,21 @@ esp-rtos = { version = "0.3.0", features = [
   "log-04",
 ] }
 esp-radio = { version = "0.18.0", features = [
+  "ble",
+  "coex",
   "esp-alloc",
   "esp32s3",
   "log-04",
   "unstable",
   "wifi",
+] }
+trouble-host = { version = "0.6", default-features = false, features = [
+  "derive",
+  "gatt",
+  "log",
+  "peripheral",
+  "default-packet-pool",
+  "default-packet-pool-mtu-255",
 ] }
 embassy-net = { version = "0.9.1", features = [
   "dhcpv4",
@@ -48,6 +58,9 @@ embedded-io-async = "0.7"
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+fontdue = { version = "0.9", default-features = false, features = ["hashbrown"] }
+heapless = { version = "0.9", default-features = false }
+embassy-sync07 = { package = "embassy-sync", version = "0.7", default-features = false }
 esp-alloc = "0.10.0"
 esp-backtrace = { version = "0.19.0", features = [
   "esp32s3",
